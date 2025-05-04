@@ -237,3 +237,111 @@
     )
   )
 )
+
+
+
+(define-constant referral-reward-percentage u20)
+(define-constant err-invalid-referrer (err u110))
+
+(define-map referral-stats principal 
+  {
+    total-referrals: uint,
+    rewards-earned: uint
+  }
+)
+
+(define-public (register-with-referral (referrer principal))
+  (let ((fee (var-get registration-fee))
+        (referrer-info (map-get? players referrer))
+        (reward-amount (/ (* fee referral-reward-percentage) u100)))
+    (asserts! (not (default-to false (get registered (map-get? players tx-sender)))) err-already-registered)
+    (asserts! (is-some referrer-info) err-invalid-referrer)
+    (try! (stx-transfer? fee tx-sender contract-owner))
+    (try! (as-contract (stx-transfer? reward-amount contract-owner referrer)))
+    
+    (map-set referral-stats referrer
+      (merge (default-to {total-referrals: u0, rewards-earned: u0} (map-get? referral-stats referrer))
+        {
+          total-referrals: (+ (default-to u0 (get total-referrals (map-get? referral-stats referrer))) u1),
+          rewards-earned: (+ (default-to u0 (get rewards-earned (map-get? referral-stats referrer))) reward-amount)
+        }
+      )
+    )
+    
+    (ok (map-set players tx-sender 
+      {
+        registered: true,
+        total-score: u0,
+        games-played: u0,
+        achievements-earned: (list),
+        rewards-claimed: u0
+      }
+    ))
+  )
+)
+
+(define-read-only (get-referral-stats (player principal))
+  (map-get? referral-stats player)
+)
+
+
+(define-constant min-stake-amount u1000000)
+(define-constant stake-fee-percentage u5)
+(define-constant err-insufficient-stake (err u111))
+
+(define-map staking-pools uint
+  {
+    total-staked: uint,
+    rewards-accumulated: uint,
+    stakers-count: uint
+  }
+)
+
+(define-map staker-positions { game-id: uint, staker: principal }
+  {
+    amount: uint,
+    rewards-claimed: uint,
+    last-claim: uint
+  }
+)
+
+(define-public (stake-in-game (game-id uint) (amount uint))
+  (let ((game-info (unwrap! (map-get? games game-id) err-game-not-found))
+        (pool (default-to {total-staked: u0, rewards-accumulated: u0, stakers-count: u0} 
+               (map-get? staking-pools game-id))))
+    (asserts! (>= amount min-stake-amount) err-insufficient-stake)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set staking-pools game-id
+      (merge pool {
+        total-staked: (+ (get total-staked pool) amount),
+        stakers-count: (+ (get stakers-count pool) u1)
+      })
+    )
+    
+    (map-set staker-positions {game-id: game-id, staker: tx-sender}
+      {
+        amount: amount,
+        rewards-claimed: u0,
+        last-claim: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-staking-rewards (game-id uint))
+  (let ((position (unwrap! (map-get? staker-positions {game-id: game-id, staker: tx-sender}) err-not-registered))
+        (pool (unwrap! (map-get? staking-pools game-id) err-game-not-found))
+        (reward-share (/ (* (get rewards-accumulated pool) (get amount position)) (get total-staked pool))))
+    (try! (as-contract (stx-transfer? reward-share tx-sender tx-sender)))
+    
+    (map-set staker-positions {game-id: game-id, staker: tx-sender}
+      (merge position {
+        rewards-claimed: (+ (get rewards-claimed position) reward-share),
+        last-claim: stacks-block-height
+      })
+    )
+    (ok reward-share)
+  )
+)
