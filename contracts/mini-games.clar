@@ -595,3 +595,212 @@
 (define-read-only (get-achievement-badge (achievement-id uint))
   (map-get? achievement-badge-mapping achievement-id)
 )
+
+(define-constant err-season-not-found (err u140))
+(define-constant err-season-not-active (err u141))
+(define-constant err-season-ended (err u142))
+(define-constant err-already-claimed-season-reward (err u143))
+(define-constant err-rank-not-found (err u144))
+
+(define-data-var current-season-id uint u1)
+(define-data-var leaderboard-update-block uint u0)
+
+(define-map seasons uint
+  {
+    name: (string-ascii 50),
+    start-block: uint,
+    end-block: uint,
+    total-prize-pool: uint,
+    participants: uint,
+    active: bool,
+    finalized: bool
+  }
+)
+
+(define-map season-leaderboard { season-id: uint, rank: uint }
+  {
+    player: principal,
+    total-score: uint,
+    games-played: uint,
+    last-updated: uint
+  }
+)
+
+(define-map season-rewards uint
+  {
+    first-place: uint,
+    second-place: uint,
+    third-place: uint,
+    top-ten: uint,
+    participation: uint
+  }
+)
+
+(define-map season-claims { season-id: uint, player: principal } bool)
+
+(define-map player-season-stats { player: principal, season-id: uint }
+  {
+    total-score: uint,
+    games-played: uint,
+    current-rank: uint,
+    last-updated: uint,
+    reward-claimed: bool
+  }
+)
+
+(define-public (create-season (name (string-ascii 50)) (duration-blocks uint) (prize-pool uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let ((season-id (var-get current-season-id))
+          (start-block (+ stacks-block-height u1))
+          (end-block (+ stacks-block-height duration-blocks)))
+      (map-set seasons season-id
+        {
+          name: name,
+          start-block: start-block,
+          end-block: end-block,
+          total-prize-pool: prize-pool,
+          participants: u0,
+          active: true,
+          finalized: false
+        }
+      )
+      (map-set season-rewards season-id
+        {
+          first-place: (/ (* prize-pool u40) u100),
+          second-place: (/ (* prize-pool u25) u100),
+          third-place: (/ (* prize-pool u15) u100),
+          top-ten: (/ (* prize-pool u15) u100),
+          participation: (/ (* prize-pool u5) u100)
+        }
+      )
+      (var-set current-season-id (+ season-id u1))
+      (ok season-id)
+    )
+  )
+)
+
+(define-public (update-leaderboard (player principal) (season-id uint))
+  (let ((season-info (unwrap! (map-get? seasons season-id) err-season-not-found))
+        (player-info (unwrap! (map-get? players player) err-not-registered))
+        (player-season-key { player: player, season-id: season-id })
+        (current-season-stats (default-to 
+          { total-score: u0, games-played: u0, current-rank: u0, last-updated: u0, reward-claimed: false }
+          (map-get? player-season-stats player-season-key))))
+    (asserts! (get active season-info) err-season-not-active)
+    (asserts! (< stacks-block-height (get end-block season-info)) err-season-ended)
+    
+    (map-set player-season-stats player-season-key
+      {
+        total-score: (get total-score player-info),
+        games-played: (get games-played player-info),
+        current-rank: u0,
+        last-updated: stacks-block-height,
+        reward-claimed: false
+      }
+    )
+    
+    (if (is-eq (get total-score current-season-stats) u0)
+      (map-set seasons season-id
+        (merge season-info { participants: (+ (get participants season-info) u1) }))
+      true
+    )
+    
+    (var-set leaderboard-update-block stacks-block-height)
+    (ok true)
+  )
+)
+
+(define-public (claim-season-reward (season-id uint))
+  (let ((season-info (unwrap! (map-get? seasons season-id) err-season-not-found))
+        (player-season-key { player: tx-sender, season-id: season-id })
+        (player-stats (unwrap! (map-get? player-season-stats player-season-key) err-not-registered))
+        (season-rewards-info (unwrap! (map-get? season-rewards season-id) err-season-not-found))
+        (claim-key { season-id: season-id, player: tx-sender })
+        (rank (get current-rank player-stats)))
+    (asserts! (get finalized season-info) err-season-not-active)
+    (asserts! (not (default-to false (map-get? season-claims claim-key))) err-already-claimed-season-reward)
+    (asserts! (> rank u0) err-rank-not-found)
+    
+    (let ((reward-amount 
+      (if (is-eq rank u1) (get first-place season-rewards-info)
+        (if (is-eq rank u2) (get second-place season-rewards-info)
+          (if (is-eq rank u3) (get third-place season-rewards-info)
+            (if (<= rank u10) (get top-ten season-rewards-info)
+              (get participation season-rewards-info)))))))
+      (try! (as-contract (stx-transfer? reward-amount contract-owner tx-sender)))
+      
+      (map-set season-claims claim-key true)
+      (map-set player-season-stats player-season-key
+        (merge player-stats { reward-claimed: true }))
+      (ok reward-amount)
+    )
+  )
+)
+
+(define-public (finalize-season (season-id uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let ((season-info (unwrap! (map-get? seasons season-id) err-season-not-found)))
+      (asserts! (>= stacks-block-height (get end-block season-info)) err-season-not-active)
+      (asserts! (not (get finalized season-info)) err-season-ended)
+      
+      (map-set seasons season-id
+        (merge season-info { active: false, finalized: true }))
+      (ok true)
+    )
+  )
+)
+
+(define-public (set-player-rank (season-id uint) (player principal) (rank uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let ((player-season-key { player: player, season-id: season-id })
+          (player-stats (unwrap! (map-get? player-season-stats player-season-key) err-not-registered)))
+      (map-set player-season-stats player-season-key
+        (merge player-stats { current-rank: rank }))
+      
+      (map-set season-leaderboard { season-id: season-id, rank: rank }
+        {
+          player: player,
+          total-score: (get total-score player-stats),
+          games-played: (get games-played player-stats),
+          last-updated: stacks-block-height
+        }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (get-season-info (season-id uint))
+  (map-get? seasons season-id)
+)
+
+(define-read-only (get-season-leaderboard (season-id uint) (rank uint))
+  (map-get? season-leaderboard { season-id: season-id, rank: rank })
+)
+
+(define-read-only (get-player-season-stats (player principal) (season-id uint))
+  (map-get? player-season-stats { player: player, season-id: season-id })
+)
+
+(define-read-only (get-season-rewards (season-id uint))
+  (map-get? season-rewards season-id)
+)
+
+(define-read-only (get-current-season)
+  (ok (- (var-get current-season-id) u1))
+)
+
+(define-read-only (check-season-reward-eligibility (player principal) (season-id uint))
+  (let ((claim-key { season-id: season-id, player: player })
+        (player-stats (map-get? player-season-stats { player: player, season-id: season-id })))
+    (if (and (is-some player-stats) 
+             (> (get current-rank (unwrap-panic player-stats)) u0)
+             (not (default-to false (map-get? season-claims claim-key))))
+      (ok true)
+      (ok false)
+    )
+  )
+)
