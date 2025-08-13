@@ -60,6 +60,10 @@
   (let ((fee (var-get registration-fee)))
     (asserts! (not (default-to false (get registered (map-get? players tx-sender)))) err-already-registered)
     (try! (stx-transfer? fee tx-sender contract-owner))
+    
+    ;; Initialize player energy system
+    (unwrap-panic (initialize-player-energy tx-sender))
+    
     (ok (map-set players tx-sender 
       {
         registered: true,
@@ -124,6 +128,10 @@
   )
     (asserts! (get active game-info) err-game-not-found)
     (asserts! (>= score u0) err-invalid-score)
+    
+    ;; Check and consume energy for gameplay
+    (try! (consume-energy tx-sender game-id))
+    
     (try! (stx-transfer? game-fee tx-sender contract-owner))
     
     ;; Update player game data
@@ -804,3 +812,261 @@
     )
   )
 )
+
+;; === ENERGY SYSTEM CONSTANTS ===
+(define-constant err-insufficient-energy (err u150))
+(define-constant err-invalid-energy-amount (err u151))
+(define-constant err-energy-upgrade-failed (err u152))
+(define-constant err-invalid-boost-type (err u153))
+
+;; Energy system configuration
+(define-data-var base-max-energy uint u100) ;; Starting energy capacity
+(define-data-var energy-regen-rate uint u1) ;; Energy per block regenerated  
+(define-data-var energy-regen-interval uint u10) ;; Blocks between regeneration
+(define-data-var energy-refill-cost uint u500000) ;; Cost to fully refill energy (0.5 STX)
+(define-data-var capacity-upgrade-cost uint u2000000) ;; Cost to upgrade capacity (2 STX)
+
+;; === ENERGY SYSTEM MAPS ===
+(define-map player-energy principal
+  {
+    current-energy: uint,
+    max-energy: uint,
+    last-regen-block: uint,
+    total-refills-purchased: uint,
+    capacity-upgrades: uint
+  }
+)
+
+(define-map game-energy-costs uint uint) ;; Maps game-id to energy cost
+(define-map energy-boosts principal
+  {
+    double-regen-until: uint, ;; Block height until double regeneration
+    reduced-costs-until: uint, ;; Block height until 50% energy costs
+    free-refills: uint ;; Number of free refills available
+  }
+)
+
+;; === ENERGY SYSTEM FUNCTIONS ===
+
+;; Initialize player energy when they register
+(define-public (initialize-player-energy (player principal))
+  (let ((base-energy (var-get base-max-energy)))
+    (map-set player-energy player
+      {
+        current-energy: base-energy,
+        max-energy: base-energy,
+        last-regen-block: stacks-block-height,
+        total-refills-purchased: u0,
+        capacity-upgrades: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Set energy cost for a specific game (owner only)
+(define-public (set-game-energy-cost (game-id uint) (energy-cost uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-some (map-get? games game-id)) err-game-not-found)
+    (map-set game-energy-costs game-id energy-cost)
+    (ok true)
+  )
+)
+
+;; Regenerate energy based on time passed
+(define-private (regenerate-energy (player principal))
+  (let ((player-energy-data (default-to 
+          { current-energy: (var-get base-max-energy), max-energy: (var-get base-max-energy), 
+            last-regen-block: stacks-block-height, total-refills-purchased: u0, capacity-upgrades: u0 }
+          (map-get? player-energy player)))
+        (blocks-passed (- stacks-block-height (get last-regen-block player-energy-data)))
+        (regen-cycles (/ blocks-passed (var-get energy-regen-interval)))
+        (base-regen-amount (* regen-cycles (var-get energy-regen-rate)))
+        (boost-data (default-to { double-regen-until: u0, reduced-costs-until: u0, free-refills: u0 }
+                      (map-get? energy-boosts player)))
+        ;; Apply double regen boost if active
+        (final-regen-amount (if (> (get double-regen-until boost-data) stacks-block-height)
+                             (* base-regen-amount u2)
+                             base-regen-amount))
+        (calculated-energy (+ (get current-energy player-energy-data) final-regen-amount))
+        (new-energy (if (> calculated-energy (get max-energy player-energy-data))
+                      (get max-energy player-energy-data)
+                      calculated-energy)))
+    (if (> regen-cycles u0)
+      (map-set player-energy player
+        (merge player-energy-data 
+          { current-energy: new-energy, last-regen-block: stacks-block-height }))
+      true
+    )
+    new-energy
+  )
+)
+
+;; Consume energy for game play
+(define-private (consume-energy (player principal) (game-id uint))
+  (let ((energy-cost (default-to u10 (map-get? game-energy-costs game-id)))
+        (current-energy (regenerate-energy player))
+        (player-energy-data (unwrap! (map-get? player-energy player) err-not-registered))
+        (boost-data (default-to { double-regen-until: u0, reduced-costs-until: u0, free-refills: u0 }
+                      (map-get? energy-boosts player)))
+        ;; Apply cost reduction boost if active
+        (final-cost (if (> (get reduced-costs-until boost-data) stacks-block-height)
+                      (/ energy-cost u2)
+                      energy-cost)))
+    (asserts! (>= current-energy final-cost) err-insufficient-energy)
+    (map-set player-energy player
+      (merge player-energy-data 
+        { current-energy: (- current-energy final-cost) }))
+    (ok final-cost)
+  )
+)
+
+;; Purchase energy refill
+(define-public (purchase-energy-refill)
+  (let ((refill-cost (var-get energy-refill-cost))
+        (player-energy-data (unwrap! (map-get? player-energy tx-sender) err-not-registered))
+        (boost-data (default-to { double-regen-until: u0, reduced-costs-until: u0, free-refills: u0 }
+                      (map-get? energy-boosts tx-sender))))
+    ;; Check if player has free refills available
+    (if (> (get free-refills boost-data) u0)
+      (begin
+        ;; Use free refill
+        (map-set energy-boosts tx-sender
+          (merge boost-data { free-refills: (- (get free-refills boost-data) u1) }))
+        (map-set player-energy tx-sender
+          (merge player-energy-data 
+            { current-energy: (get max-energy player-energy-data) }))
+        (ok u0)
+      )
+      (begin
+        ;; Purchase refill with STX
+        (try! (stx-transfer? refill-cost tx-sender contract-owner))
+        (map-set player-energy tx-sender
+          (merge player-energy-data 
+            { current-energy: (get max-energy player-energy-data),
+              total-refills-purchased: (+ (get total-refills-purchased player-energy-data) u1) }))
+        (ok refill-cost)
+      )
+    )
+  )
+)
+
+;; Purchase energy capacity upgrade
+(define-public (purchase-capacity-upgrade)
+  (let ((upgrade-cost (var-get capacity-upgrade-cost))
+        (player-energy-data (unwrap! (map-get? player-energy tx-sender) err-not-registered))
+        (new-max-energy (+ (get max-energy player-energy-data) u25))) ;; +25 max energy per upgrade
+    (try! (stx-transfer? upgrade-cost tx-sender contract-owner))
+    (map-set player-energy tx-sender
+      (merge player-energy-data 
+        { max-energy: new-max-energy,
+          capacity-upgrades: (+ (get capacity-upgrades player-energy-data) u1) }))
+    (ok new-max-energy)
+  )
+)
+
+;; Grant energy boosts (owner only, for promotions/rewards)
+(define-public (grant-energy-boost (player principal) (boost-type (string-ascii 20)) (duration-blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (let ((boost-data (default-to { double-regen-until: u0, reduced-costs-until: u0, free-refills: u0 }
+                        (map-get? energy-boosts player)))
+          (target-block (+ stacks-block-height duration-blocks)))
+      (if (is-eq boost-type "double-regen")
+        (begin
+          (map-set energy-boosts player
+            (merge boost-data { double-regen-until: target-block }))
+          (ok true)
+        )
+        (if (is-eq boost-type "reduced-costs") 
+          (begin
+            (map-set energy-boosts player
+              (merge boost-data { reduced-costs-until: target-block }))
+            (ok true)
+          )
+          (if (is-eq boost-type "free-refills")
+            (begin
+              (map-set energy-boosts player
+                (merge boost-data { free-refills: (+ (get free-refills boost-data) duration-blocks) }))
+              (ok true)
+            )
+            (ok false)
+          )
+        )
+      )
+    )
+  )
+)
+
+;; === ENERGY SYSTEM READ-ONLY FUNCTIONS ===
+
+(define-read-only (get-player-energy (player principal))
+  (let ((player-energy-data (map-get? player-energy player)))
+    (if (is-some player-energy-data)
+      (let ((energy-data (unwrap-panic player-energy-data))
+            (blocks-passed (- stacks-block-height (get last-regen-block energy-data)))
+            (regen-cycles (/ blocks-passed (var-get energy-regen-interval)))
+            (base-regen-amount (* regen-cycles (var-get energy-regen-rate)))
+            (boost-data (default-to { double-regen-until: u0, reduced-costs-until: u0, free-refills: u0 }
+                          (map-get? energy-boosts player)))
+            (final-regen-amount (if (> (get double-regen-until boost-data) stacks-block-height)
+                                 (* base-regen-amount u2)
+                                 base-regen-amount))
+            (calculated-energy (+ (get current-energy energy-data) final-regen-amount))
+            (new-energy (if (> calculated-energy (get max-energy energy-data))
+                          (get max-energy energy-data)
+                          calculated-energy)))
+        (some (merge energy-data { current-energy: new-energy })))
+      none
+    )
+  )
+)
+
+(define-read-only (get-game-energy-cost (game-id uint))
+  (default-to u10 (map-get? game-energy-costs game-id))
+)
+
+(define-read-only (get-energy-boosts (player principal))
+  (map-get? energy-boosts player)
+)
+
+(define-read-only (calculate-energy-regen-time (player principal) (target-energy uint))
+  (let ((player-energy-data (map-get? player-energy player)))
+    (if (is-some player-energy-data)
+      (let ((energy-data (unwrap-panic player-energy-data))
+            (blocks-passed (- stacks-block-height (get last-regen-block energy-data)))
+            (regen-cycles (/ blocks-passed (var-get energy-regen-interval)))
+            (base-regen-amount (* regen-cycles (var-get energy-regen-rate)))
+            (boost-data (default-to { double-regen-until: u0, reduced-costs-until: u0, free-refills: u0 }
+                          (map-get? energy-boosts player)))
+            (final-regen-amount (if (> (get double-regen-until boost-data) stacks-block-height)
+                                 (* base-regen-amount u2)
+                                 base-regen-amount))
+            (calculated-energy (+ (get current-energy energy-data) final-regen-amount))
+            (current-energy (if (> calculated-energy (get max-energy energy-data))
+                              (get max-energy energy-data)
+                              calculated-energy))
+            (energy-needed (if (> target-energy current-energy) 
+                             (- target-energy current-energy) 
+                             u0))
+            (regen-rate (if (> (get double-regen-until boost-data) stacks-block-height)
+                          (* (var-get energy-regen-rate) u2)
+                          (var-get energy-regen-rate)))
+            (blocks-needed (* (/ energy-needed regen-rate) (var-get energy-regen-interval))))
+        (ok blocks-needed))
+      (err err-not-registered)
+    )
+  )
+)
+
+(define-read-only (get-energy-system-config)
+  (ok {
+    base-max-energy: (var-get base-max-energy),
+    energy-regen-rate: (var-get energy-regen-rate),
+    energy-regen-interval: (var-get energy-regen-interval),
+    energy-refill-cost: (var-get energy-refill-cost),
+    capacity-upgrade-cost: (var-get capacity-upgrade-cost)
+  })
+)
+
