@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/mini-games.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.daily-challenges]
+path = 'contracts/daily-challenges.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
